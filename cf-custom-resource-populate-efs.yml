@@ -1,0 +1,279 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Description: Demonstrates usage of a Lambda-backed Custom Resource to create an EFS Volume and populate it with content from a Zip File.
+
+# NOTE:
+# - This template was tested with EFS volume mounts deployed within private subnets, wherein the subnets were provided with internet access via a Nat Gateway.
+# - This approach will not work with Internet Gateways due to the public IP address limitations limitations inherent to AWS Lambda.
+#   See: https://stackoverflow.com/questions/52992085/why-cant-an-aws-lambda-function-inside-a-public-subnet-in-a-vpc-connect-to-the
+
+Parameters:
+
+  EnvName:
+    Type: String
+    Description: An environment name that is prefixed to resource names.
+    Default: dev
+
+  VpcId: 
+    Type: String
+    Description: Id of Vpc where EFS MountTarget will be created.
+    AllowedPattern: '^vpc-[a-f0-9]*$'
+
+  SubnetId:
+    Type: String
+    Description: Id of Subnet where EFS MountTarget will be created.
+    AllowedPattern: '^subnet-[a-f0-9]*$'
+
+  EfsRootDirectory:
+    Type: String
+    Description: The root directory path to use on the efs volume.
+    AllowedPattern: "^[a-zA-Z0-9-_.]+$"
+    ConstraintDescription: Specific directory (eg. 'files') cannot be empty.
+    Default: files
+
+  EfsSubdirectory:
+    Type: String
+    Description: Subdirectory to which the zip file will be extracted eg. Root directory path 'files' and subdirectory "foobar" will result in the zip file being extracted to 'files/foobar'.
+    AllowedPattern: '^([a-zA-Z0-9_\-]+(\/[a-zA-Z0-9_\-]+)*)*$'
+    ConstraintDescription: Directory path, no slash prefix, no trailing slash, can be empty.
+    Default: ""
+
+  ZipFileUrl:
+    Type: String
+    Description: Url to zip file used to populate the EFS volume.
+    AllowedPattern: '^https?:\/\/[^\s/$.?#].[^\s]*$'
+    Default: https://github.com/AydanBedingham/cf-custom-resource-populate-efs/raw/main/sample.zip
+
+
+Resources:
+
+##################################################
+# EFS
+##################################################
+
+  FileSystem:
+    Type: AWS::EFS::FileSystem
+    UpdateReplacePolicy: Delete
+    DeletionPolicy: Delete
+    Properties:
+      Encrypted: true
+      FileSystemTags:
+      - Key: Name
+        Value: !Sub ${EnvName}-efs-filesystem
+      PerformanceMode: generalPurpose
+      ThroughputMode: bursting
+
+  SubnetMountTarget:
+    Type: AWS::EFS::MountTarget
+    DependsOn:
+    - FileSystem
+    - EfsSecurityGroup
+    Properties:
+      FileSystemId: !Ref FileSystem
+      SubnetId: !Ref SubnetId
+      SecurityGroups:
+      - !Ref EfsSecurityGroup
+
+  EfsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub ${EnvName}-sg-efs-filesystem
+      GroupDescription: Security group for EFS filesystem
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 2049 # NFS (Network File Storage) Port
+          ToPort: 2049
+          CidrIp: 0.0.0.0/0
+
+##################################################
+# Custom logic used to download the zip file and populate EFS
+#
+# - Defines an access point and security groups to allow the lambda to communicate with the EFS volume
+# - Defines a lambda-backed custom resource with properies related to EfsVolume, Zipe file and destination
+# - Zip file is downloaded to lambda ephemeral storage and unzipped to target location on EFS (overwriting conflicting files)
+# - Custom resource properties related to the EfsVolume, Zipe file and destination are modified this will cause the lambda-backed custom resource to re-execute the lambda function
+##################################################
+
+  EfsAccessPoint:
+    Type: AWS::EFS::AccessPoint
+    Properties:
+      FileSystemId: !Ref FileSystem
+      PosixUser:
+        Uid: "1000"
+        Gid: "1000"
+      RootDirectory:
+        Path: !Sub /${EfsRootDirectory}
+        CreationInfo:
+          OwnerUid: "1000"
+          OwnerGid: "1000"
+          Permissions: "755"
+
+  PopulateEfsCustomResource:
+    Type: Custom::PopulateEfs
+    Properties:
+      ServiceToken: !GetAtt populateEfsFunction.Arn
+      FileSystemId: !Ref FileSystem
+      AccessPointId: !Ref EfsAccessPoint
+      EfsRootDirectory: !Ref EfsRootDirectory
+      EfsSubdirectory: !Ref EfsSubdirectory
+      ZipFileUrl: !Ref ZipFileUrl
+
+  populateEfsFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: SubnetMountTarget
+    Properties:
+      FunctionName: !Sub ${EnvName}-lmbda-PopulateEfs
+      Handler: index.lambda_handler
+      Role: !GetAtt PopulateEfsLambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import os
+          import json
+          import cfnresponse
+          import urllib.request
+          import zipfile
+
+          def download_file(file_url, local_file_path, chunk_size=1024*1024):
+            # Ensure the directory exists
+            local_dir = os.path.dirname(local_file_path)
+            if not os.path.exists(local_dir):
+                os.makedirs(local_dir)
+            with urllib.request.urlopen(file_url) as response, open(local_file_path, 'wb') as out_file:
+                while True:
+                    chunk = response.read(chunk_size)
+                    if not chunk:
+                        break
+                    out_file.write(chunk)
+                    print(f"Downloading {file_url}: {out_file.tell()} bytes", flush=True)  # Log progress
+            print(f"File downloaded and saved to {local_file_path}")
+
+          def unzip_file(zip_file, extract_dir):
+            local_dir = os.path.dirname(extract_dir)
+            if not os.path.exists(local_dir):
+                os.makedirs(local_dir)
+            with zipfile.ZipFile(zip_file, 'r') as zip_ref:
+              for member in zip_ref.infolist():
+                zip_ref.extract(member, path=extract_dir)
+
+          def resource_create(event, context):
+            output_path = f"/mnt/{event['ResourceProperties']['EfsRootDirectory']}"
+            subdirectory = event['ResourceProperties']['EfsSubdirectory']
+            if len(subdirectory)>0:
+              output_path = f'{output_path}/{subdirectory}'
+            zip_file_url = event['ResourceProperties']['ZipFileUrl']
+            zip_file_path = f"/tmp/output.zip"
+            download_file(zip_file_url, zip_file_path)
+            unzip_file(zip_file_path, output_path)
+
+          def resource_update(event, context):
+            return resource_create(event, context)
+
+          def resource_delete(event, context):
+            return
+
+          def lambda_handler(event, context):
+            print('event: {}'.format(json.dumps(event)))
+            try:
+              request_type = event.get('RequestType')
+              if request_type == 'Create':
+                resource_create(event, context)
+              elif request_type == 'Update':
+                resource_update(event, context)
+              elif request_type == 'Delete':
+                resource_delete(event, context)
+              else:
+                raise Exception('Unknown RequestType: {}'.format(request_type))
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+            except Exception as e:
+              cfnresponse.send(event, context, cfnresponse.FAILED, {})
+              raise e
+      Runtime: "python3.8"
+      Timeout: 600
+      FileSystemConfigs:
+        - Arn: !GetAtt EfsAccessPoint.Arn
+          LocalMountPath: !Sub /mnt/${EfsRootDirectory}
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref PopulateEfsLambdaSecurityGroup
+        SubnetIds:
+          - !Ref SubnetId
+
+  PopulateEfsLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties: 
+      RoleName: !Sub ${EnvName}-role-PopulateEfs-lmbda-exec
+      AssumeRolePolicyDocument: 
+        Version: "2012-10-17"
+        Statement: 
+          - Effect: "Allow"
+            Principal: 
+              Service: "lambda.amazonaws.com"
+            Action: 
+              - "sts:AssumeRole"
+      Policies: 
+        - PolicyName: EfsAccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeNetworkInterfaces
+                  - ec2:CreateNetworkInterface
+                  - ec2:DeleteNetworkInterface
+                  - ec2:DescribeInstances
+                  - ec2:AttachNetworkInterface
+                  - elasticfilesystem:ClientMount
+                  - elasticfilesystem:ClientWrite
+                  - elasticfilesystem:ClientRootAccess
+                Resource: "*"
+        - PolicyName: Logging
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "arn:aws:logs:*:*:*"
+        - PolicyName: CloudFormationCallback
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudformation:SendResponse
+                Resource: "arn:aws:cloudformation:*:*:*"
+
+  PopulateEfsLambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub ${EnvName}-sg-lmbda-PopulatEefs
+      GroupDescription: "Allow access to EFS"
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          FromPort: -1
+          ToPort: -1
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 2049 # NFS
+          ToPort: 2049
+          DestinationSecurityGroupId: !Ref EfsSecurityGroup
+        - IpProtocol: "-1"
+          CidrIp: '0.0.0.0/0'
+          
+Outputs:
+
+  EfsFileSystemDns:
+    Description: EFS FileSystem Dns
+    Value: !Sub "${FileSystem.FileSystemId}.efs.ap-southeast-2.amazonaws.com"
+
+  EfsFileSystemId:
+    Description: EFS FileSystem Id
+    Value: !Sub "${FileSystem.FileSystemId}"
+
+  EfsSecurityGroup:
+    Description: Efs SecurityGroup. Can be used as the DestinationSecurityGroupId in another SG to allow acccess to the EFS filesystem volume.
+    Value: !Ref EfsSecurityGroup
